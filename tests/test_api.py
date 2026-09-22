@@ -1,5 +1,7 @@
 """API integration tests: creation, allocation correctness, rejection rules."""
 
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -278,6 +280,119 @@ class TestBatchCreate:
         assert client.get("/api/v1/invoices").json() == []
 
 
+class TestVoid:
+    @pytest.fixture()
+    def created_id(self, client):
+        resp = client.post("/api/v1/invoices", json=valid_payload())
+        assert resp.status_code == 201
+        return resp.json()["invoice_id"]
+
+    def test_void_validated_invoice(self, client, created_id):
+        resp = client.post(
+            f"/api/v1/invoices/{created_id}/void",
+            json={"reason": "issued with wrong amount", "operator": "alice"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "voided"
+        assert body["void"]["reason"] == "issued with wrong amount"
+        assert body["void"]["operator"] == "alice"
+        assert body["void"]["voided_at"]
+        # Voiding does not alter the computed figures.
+        assert body["totals"]["grand_total"] == 236.44
+
+    def test_get_returns_void_details_after_void(self, client, created_id):
+        void = client.post(
+            f"/api/v1/invoices/{created_id}/void",
+            json={"reason": "duplicate billing", "operator": "bob"},
+        ).json()
+        got = client.get(f"/api/v1/invoices/{created_id}")
+        assert got.status_code == 200
+        body = got.json()
+        assert body["status"] == "voided"
+        assert body["void"] == void["void"]
+
+    def test_get_before_void_has_no_void_field(self, client, created_id):
+        body = client.get(f"/api/v1/invoices/{created_id}").json()
+        assert body["status"] == "validated"
+        assert "void" not in body
+
+    def test_repeat_void_returns_409_and_single_event(self, client, created_id):
+        payload = {"reason": "customer cancelled", "operator": "alice"}
+        assert client.post(f"/api/v1/invoices/{created_id}/void", json=payload).status_code == 200
+
+        resp = client.post(f"/api/v1/invoices/{created_id}/void", json=payload)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "already_voided"
+
+        store = app.dependency_overrides[get_store]()
+        with sqlite3.connect(store.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM void_events WHERE invoice_id = ?",
+                (created_id,),
+            ).fetchone()[0]
+        assert count == 1
+
+    def test_void_non_validated_invoice_returns_409_without_event(self, client, created_id):
+        store = app.dependency_overrides[get_store]()
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE invoices SET status = 'inconsistent' WHERE id = ?",
+                (created_id,),
+            )
+
+        resp = client.post(
+            f"/api/v1/invoices/{created_id}/void",
+            json={"reason": "n/a", "operator": "alice"},
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "not_voidable"
+
+        # Status untouched and no event written.
+        body = client.get(f"/api/v1/invoices/{created_id}").json()
+        assert body["status"] == "inconsistent"
+        assert "void" not in body
+        with sqlite3.connect(store.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM void_events").fetchone()[0]
+        assert count == 0
+
+    def test_void_missing_invoice_404(self, client):
+        resp = client.post(
+            "/api/v1/invoices/does-not-exist/void",
+            json={"reason": "n/a", "operator": "alice"},
+        )
+        assert resp.status_code == 404
+
+    def test_void_requires_reason_and_operator(self, client, created_id):
+        missing = client.post(f"/api/v1/invoices/{created_id}/void", json={})
+        assert missing.status_code == 422
+        blank = client.post(
+            f"/api/v1/invoices/{created_id}/void",
+            json={"reason": "   ", "operator": "alice"},
+        )
+        assert blank.status_code == 422
+        # Nothing was voided.
+        body = client.get(f"/api/v1/invoices/{created_id}").json()
+        assert body["status"] == "validated"
+
+    def test_void_event_is_immutable(self, client, created_id):
+        client.post(
+            f"/api/v1/invoices/{created_id}/void",
+            json={"reason": "on hold", "operator": "alice"},
+        )
+        store = app.dependency_overrides[get_store]()
+        with sqlite3.connect(store.db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute(
+                    "UPDATE void_events SET reason = 'tampered' WHERE invoice_id = ?",
+                    (created_id,),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute(
+                    "DELETE FROM void_events WHERE invoice_id = ?", (created_id,)
+                )
+
+
 class TestQuery:
     def test_get_invoice_returns_stored_result(self, client):
         created = client.post("/api/v1/invoices", json=valid_payload()).json()
@@ -299,6 +414,35 @@ class TestQuery:
         numbers = {item["invoice_number"] for item in resp.json()}
         assert numbers == {"INV-2026-0001", "INV-2026-0002"}
         assert resp.json()[0]["grand_total"] == 236.44
+        assert {item["status"] for item in resp.json()} == {"validated"}
+
+    def test_list_excludes_voided_by_default(self, client):
+        first = client.post(
+            "/api/v1/invoices", json=valid_payload(invoice_number="INV-LIST-1")
+        ).json()
+        client.post(
+            "/api/v1/invoices", json=valid_payload(invoice_number="INV-LIST-2")
+        )
+        assert client.post(
+            f"/api/v1/invoices/{first['invoice_id']}/void",
+            json={"reason": "mistake", "operator": "alice"},
+        ).status_code == 200
+
+        default_list = client.get("/api/v1/invoices").json()
+        assert {i["invoice_number"] for i in default_list} == {"INV-LIST-2"}
+
+        included = client.get("/api/v1/invoices", params={"include_voided": "true"}).json()
+        by_number = {i["invoice_number"]: i for i in included}
+        assert set(by_number) == {"INV-LIST-1", "INV-LIST-2"}
+        assert by_number["INV-LIST-1"]["status"] == "voided"
+        assert by_number["INV-LIST-2"]["status"] == "validated"
+
+    def test_list_include_voided_false_parsed(self, client):
+        client.post("/api/v1/invoices", json=valid_payload())
+        assert (
+            client.get("/api/v1/invoices", params={"include_voided": "false"}).status_code
+            == 200
+        )
 
     def test_health(self, client):
         assert client.get("/health").json() == {"status": "ok"}

@@ -18,7 +18,7 @@ docker compose up --build
 | http://localhost:8000/health | 健康检查 |
 | http://localhost:8000/api/v1/invoices | 发票接口 |
 
-SQLite 数据保存在名为 `invoice-data` 的卷中（容器内 `/data/invoices.db`），重启不丢失。
+SQLite 数据保存在名为 `invoice-data` 的卷中（容器内 `/data/invoices.db`），重启不丢失。容器启动时会自动建表（发票表与不可变的 `void_events` 作废事件表）；旧版本遗留的数据库会在启动时自动迁移（补齐 `status` 列与作废事件表），无需手工处理。
 
 也可以不用 Compose，直接构建运行：
 
@@ -33,7 +33,7 @@ docker run -p 8000:8000 -v invoice-data:/data invoice-allocation-api
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest                 # 运行测试（29 个用例）
+pytest                 # 运行测试（39 个用例）
 ```
 
 数据库路径通过环境变量 `DATABASE_PATH` 配置（默认 `data/invoices.db`）。
@@ -44,8 +44,9 @@ pytest                 # 运行测试（29 个用例）
 | --- | --- | --- |
 | `POST` | `/api/v1/invoices` | 创建发票：计算分摊、校验、落库，返回完整结果（201） |
 | `POST` | `/api/v1/invoices/batch` | 原子批量开票：整批先计算校验，再同事务写入；任一失败整批回滚（201） |
-| `GET` | `/api/v1/invoices/{invoice_id}` | 按 ID 查询已计算的发票结果 |
-| `GET` | `/api/v1/invoices` | 发票列表（`limit` / `offset` 分页） |
+| `GET` | `/api/v1/invoices/{invoice_id}` | 按 ID 查询已计算的发票结果（含作废时间、操作人、原因） |
+| `POST` | `/api/v1/invoices/{invoice_id}/void` | 作废（红冲）已验证发票：同事务写入不可调用作废事件并更新状态 |
+| `GET` | `/api/v1/invoices` | 发票列表（`limit` / `offset` 分页，默认排除已作废，`include_voided=true` 可包含） |
 | `GET` | `/health` | 健康检查 |
 
 ### 创建发票示例
@@ -139,6 +140,57 @@ curl -X POST http://localhost:8000/api/v1/invoices/batch \
 
 发票号重复（批内互重或已存在于库中）返回 409，`errors[]` 同样按 `index` 标出冲突的发票。
 
+### 发票作废
+
+`POST /api/v1/invoices/{invoice_id}/void` 接收两个**必填**字段（均不可为空白）：
+
+```json
+{
+  "reason": "金额开错，已重开 INV-2026-0009",
+  "operator": "alice.zhang"
+}
+```
+
+规则：
+
+- **仅 `status` 为 `validated` 的发票可以作废**；其他状态返回 409（`error: not_voidable`），发票不存在返回 404。
+- 服务端在**同一个 SQLite 事务**中：向 `void_events` 表写入一条作废事件（作废时间、操作人、原因），并把发票 `status` 更新为 `voided`；任一失败整体回滚。
+- 作废事件是**不可篡改的审计记录**：`void_events` 以发票 ID 为主键，并由数据库触发器禁止 `UPDATE` / `DELETE`。
+- **重复作废返回 409**（`error: already_voided`），绝不会产生第二条事件。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/invoices/<invoice_id>/void \
+  -H 'Content-Type: application/json' \
+  -d @examples/void_invoice.json
+```
+
+作废成功返回更新后的完整发票（200）：`status` 为 `voided`，并新增 `void` 字段；之后调用 `GET /api/v1/invoices/{invoice_id}` 也会返回相同内容：
+
+```json
+{
+  "invoice_id": "f3c9…",
+  "invoice_number": "INV-2026-0001",
+  "status": "voided",
+  "totals": { "...": "金额字段保持不变" },
+  "created_at": "2026-09-22T08:00:00Z",
+  "void": {
+    "voided_at": "2026-09-22T09:30:00Z",
+    "operator": "alice.zhang",
+    "reason": "金额开错，已重开 INV-2026-0009"
+  }
+}
+```
+
+未作废发票的响应中不含 `void` 字段。
+
+### 列表与作废过滤
+
+`GET /api/v1/invoices` 默认**排除已作废发票**，每项摘要新增 `status` 字段。需要查看已作废发票时传 `include_voided=true`：
+
+```bash
+curl 'http://localhost:8000/api/v1/invoices?include_voided=true&limit=50&offset=0'
+```
+
 ## 计算规则
 
 1. **全程 Decimal**：所有金额以 `decimal.Decimal` 计算，按 `ROUND_HALF_UP` 精确到分（0.01），不使用浮点。
@@ -155,7 +207,10 @@ curl -X POST http://localhost:8000/api/v1/invoices/batch \
 | `expected_totals` 与计算结果不一致 | 400（返回各项差异明细） |
 | `invoice_number` 重复 | 409 |
 | 批量请求中任一发票校验失败 / 发票号重复（整批回滚，按 `index` 返回错误） | 400 / 409 |
-| 查询不存在的发票 | 404 |
+| 作废请求缺少 `reason` / `operator` 或为空白 | 422 |
+| 作废非 `validated` 状态的发票（如 `inconsistent`） | 409（`not_voidable`） |
+| 重复作废（不产生第二条作废事件） | 409（`already_voided`） |
+| 查询 / 作废不存在的发票 | 404 |
 
 ## 项目结构
 
@@ -165,8 +220,8 @@ app/
   schemas.py     请求/响应模型（含比例一致性校验）
   allocation.py  Decimal 精确计算与最大余数法
   service.py     发票计算：折扣、税区分摊、总额校验
-  db.py          SQLite 持久化（Decimal 以字符串无损存储）
+  db.py          SQLite 持久化（Decimal 以字符串无损存储；作废事件不可变）
 tests/           pytest 单元测试与 API 集成测试
-examples/        示例请求
+examples/        示例请求（create_invoice / batch / void_invoice）
 Dockerfile / docker-compose.yml
 ```

@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .allocation import PROPORTION_TOLERANCE
 
@@ -73,6 +73,21 @@ class InvoiceBatchCreate(BaseModel):
     invoices: list[InvoiceCreate] = Field(min_length=1, max_length=100)
 
 
+class InvoiceVoidRequest(BaseModel):
+    """Body for voiding (red-flushing) a validated invoice."""
+
+    reason: str = Field(min_length=1, max_length=500, description="Why the invoice is voided")
+    operator: str = Field(min_length=1, max_length=100, description="Who performed the void")
+
+    @field_validator("reason", "operator")
+    @classmethod
+    def strip_and_reject_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
@@ -125,6 +140,14 @@ class ValidationReport(BaseModel):
     checks: list[CheckItem]
 
 
+class VoidInfo(BaseModel):
+    """Immutable record of an invoice void (red-flush) event."""
+
+    voided_at: str
+    operator: str
+    reason: str
+
+
 class InvoiceResult(BaseModel):
     invoice_id: str
     invoice_number: str
@@ -134,12 +157,14 @@ class InvoiceResult(BaseModel):
     totals: Totals
     validation: ValidationReport
     created_at: str
+    void: Optional[VoidInfo] = None
 
 
 class InvoiceSummary(BaseModel):
     invoice_id: str
     invoice_number: str
     currency: str
+    status: str
     grand_total: Decimal
     created_at: str
 

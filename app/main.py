@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from .db import InvoiceStore
+from .db import (
+    InvoiceNotFoundError,
+    InvoiceStore,
+    InvoiceVoidConflictError,
+)
 from .schemas import (
     InvoiceBatchCreate,
     InvoiceBatchItemResult,
@@ -18,22 +24,33 @@ from .schemas import (
     InvoiceCreate,
     InvoiceResult,
     InvoiceSummary,
+    InvoiceVoidRequest,
 )
 from .service import TotalsMismatchError, compute_invoice
 
 DEFAULT_DB_PATH = os.environ.get("DATABASE_PATH", "data/invoices.db")
 
+_store: InvoiceStore | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize (and, for existing volumes, migrate) the SQLite schema at
+    # container startup instead of waiting for the first request.
+    get_store()
+    yield
+
+
 app = FastAPI(
     title="Multi-Region Invoice Allocation API",
     version="1.0.0",
+    lifespan=lifespan,
     description=(
         "Computes exact (Decimal) invoice discounts and per-tax-region amounts, "
         "distributes rounding residuals with the largest remainder method, and "
         "rejects inconsistent proportions or totals."
     ),
 )
-
-_store: InvoiceStore | None = None
 
 
 def get_store() -> InvoiceStore:
@@ -55,8 +72,10 @@ def to_jsonable(obj: Any) -> Any:
 
 
 def result_response(result: InvoiceResult, status_code: int = 200) -> JSONResponse:
+    # exclude_none keeps the "void" key absent for non-voided invoices.
     return JSONResponse(
-        status_code=status_code, content=to_jsonable(result.model_dump())
+        status_code=status_code,
+        content=to_jsonable(result.model_dump(exclude_none=True)),
     )
 
 
@@ -75,6 +94,7 @@ def root() -> dict:
             "create_invoice": "POST /api/v1/invoices",
             "create_invoices_batch": "POST /api/v1/invoices/batch",
             "get_invoice": "GET /api/v1/invoices/{invoice_id}",
+            "void_invoice": "POST /api/v1/invoices/{invoice_id}/void",
             "list_invoices": "GET /api/v1/invoices",
         },
     }
@@ -261,10 +281,65 @@ def get_invoice(
     return result_response(result)
 
 
+@app.post(
+    "/api/v1/invoices/{invoice_id}/void",
+    response_model=InvoiceResult,
+    tags=["invoices"],
+    responses={
+        404: {"description": "Invoice not found"},
+        409: {"description": "Invoice already voided, or not in validated status"},
+        422: {"description": "Invalid input (missing or blank reason/operator)"},
+    },
+)
+def void_invoice(
+    invoice_id: str,
+    payload: InvoiceVoidRequest,
+    store: InvoiceStore = Depends(get_store),
+) -> JSONResponse:
+    """Void (red-flush) a validated invoice.
+
+    Only invoices with status ``validated`` can be voided. The immutable void
+    event (time, operator, reason) is appended and the invoice status is
+    updated to ``voided`` in a single SQLite transaction. Repeating the void
+    returns 409 without ever writing a second event.
+    """
+    voided_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        stored = store.void_invoice(
+            invoice_id=invoice_id,
+            reason=payload.reason,
+            operator=payload.operator,
+            voided_at=voided_at,
+        )
+    except InvoiceNotFoundError:
+        raise HTTPException(status_code=404, detail="invoice not found")
+    except InvoiceVoidConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": exc.code,
+                "message": str(exc),
+                "invoice_id": invoice_id,
+                "status": exc.status,
+            },
+        )
+
+    result = InvoiceResult.model_validate(stored)
+    return result_response(result)
+
+
 @app.get("/api/v1/invoices", response_model=list[InvoiceSummary], tags=["invoices"])
 def list_invoices(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    include_voided: bool = Query(
+        default=False,
+        description="Set true to include voided invoices; they are excluded by default",
+    ),
     store: InvoiceStore = Depends(get_store),
 ) -> JSONResponse:
-    return JSONResponse(content=to_jsonable(store.list_summaries(limit, offset)))
+    return JSONResponse(
+        content=to_jsonable(
+            store.list_summaries(limit, offset, include_voided=include_voided)
+        )
+    )
