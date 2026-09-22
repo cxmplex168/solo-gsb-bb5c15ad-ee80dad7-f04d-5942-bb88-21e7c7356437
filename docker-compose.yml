@@ -1,0 +1,15 @@
+services:
+  invoice-api:
+    build: .
+    image: invoice-allocation-api:latest
+    container_name: invoice-allocation-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/invoices.db
+    volumes:
+      - invoice-data:/data
+    restart: unless-stopped
+
+volumes:
+  invoice-data:

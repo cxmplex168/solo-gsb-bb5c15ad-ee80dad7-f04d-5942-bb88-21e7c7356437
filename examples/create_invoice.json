@@ -1,0 +1,29 @@
+{
+  "invoice_number": "INV-2026-0001",
+  "currency": "CNY",
+  "lines": [
+    {
+      "description": "Consulting services",
+      "quantity": "2",
+      "unit_price": "100.00",
+      "discount_rate": "0.10",
+      "tax_regions": [
+        {"region_code": "CN-SH", "tax_rate": "0.13", "proportion": "0.6"},
+        {"region_code": "CN-BJ", "tax_rate": "0.13", "proportion": "0.4"}
+      ]
+    },
+    {
+      "description": "Hardware",
+      "quantity": "1",
+      "unit_price": "33.33",
+      "discount_amount": "3.33",
+      "tax_regions": [
+        {"region_code": "CN-SH", "tax_rate": "0.13", "proportion": "0.5"},
+        {"region_code": "US-CA", "tax_rate": "0.0725", "proportion": "0.5"}
+      ]
+    }
+  ],
+  "expected_totals": {
+    "grand_total": "236.44"
+  }
+}
