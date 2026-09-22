@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from .db import InvoiceStore
+from .db import (
+    InvoiceAlreadyVoidedError,
+    InvoiceNotFoundError,
+    InvoiceNotVoidableError,
+    InvoiceStore,
+)
 from .schemas import (
     InvoiceBatchCreate,
     InvoiceBatchItemResult,
@@ -18,6 +24,7 @@ from .schemas import (
     InvoiceCreate,
     InvoiceResult,
     InvoiceSummary,
+    InvoiceVoidRequest,
 )
 from .service import TotalsMismatchError, compute_invoice
 
@@ -75,6 +82,7 @@ def root() -> dict:
             "create_invoice": "POST /api/v1/invoices",
             "create_invoices_batch": "POST /api/v1/invoices/batch",
             "get_invoice": "GET /api/v1/invoices/{invoice_id}",
+            "void_invoice": "POST /api/v1/invoices/{invoice_id}/void",
             "list_invoices": "GET /api/v1/invoices",
         },
     }
@@ -253,10 +261,65 @@ def create_invoices_batch(
 def get_invoice(
     invoice_id: str, store: InvoiceStore = Depends(get_store)
 ) -> JSONResponse:
-    stored = store.get_result(invoice_id)
+    stored = store.get_invoice(invoice_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="invoice not found")
     # Re-validate so Decimal fields round-trip exactly, then render as numbers.
+    result = InvoiceResult.model_validate(stored)
+    return result_response(result)
+
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/void",
+    response_model=InvoiceResult,
+    tags=["invoices"],
+    responses={
+        404: {"description": "Invoice not found"},
+        409: {"description": "Invoice is already voided, or its status is not 'validated'"},
+        422: {"description": "Invalid input (reason / operator missing or empty)"},
+    },
+)
+def void_invoice(
+    invoice_id: str,
+    payload: InvoiceVoidRequest,
+    store: InvoiceStore = Depends(get_store),
+) -> JSONResponse:
+    """Void a validated invoice.
+
+    The immutable void event (reason, operator, timestamp) and the invoice
+    status update are committed in one SQLite transaction. Repeating the call
+    returns 409 without recording a second event.
+    """
+    voided_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        store.void_invoice(
+            invoice_id=invoice_id,
+            reason=payload.reason,
+            operator=payload.operator,
+            voided_at=voided_at,
+        )
+    except InvoiceNotFoundError:
+        raise HTTPException(status_code=404, detail="invoice not found")
+    except InvoiceAlreadyVoidedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "already_voided",
+                "message": f"invoice '{invoice_id}' is already voided",
+                "void": exc.event,
+            },
+        )
+    except InvoiceNotVoidableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "invalid_status",
+                "message": f"only 'validated' invoices can be voided, current status is '{exc.status}'",
+                "status": exc.status,
+            },
+        )
+
+    stored = store.get_invoice(invoice_id)
     result = InvoiceResult.model_validate(stored)
     return result_response(result)
 
@@ -265,6 +328,13 @@ def get_invoice(
 def list_invoices(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    include_voided: bool = Query(
+        default=False, description="Include voided invoices; excluded by default"
+    ),
     store: InvoiceStore = Depends(get_store),
 ) -> JSONResponse:
-    return JSONResponse(content=to_jsonable(store.list_summaries(limit, offset)))
+    return JSONResponse(
+        content=to_jsonable(
+            store.list_summaries(limit, offset, include_voided=include_voided)
+        )
+    )

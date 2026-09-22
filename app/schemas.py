@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from .allocation import PROPORTION_TOLERANCE
 
@@ -73,6 +73,18 @@ class InvoiceBatchCreate(BaseModel):
     invoices: list[InvoiceCreate] = Field(min_length=1, max_length=100)
 
 
+class InvoiceVoidRequest(BaseModel):
+    """Void a validated invoice. Both fields are required and recorded in the
+    immutable void event."""
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)] = Field(
+        description="Why the invoice is being voided"
+    )
+    operator: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)] = Field(
+        description="Who performs the void (recorded as voided_by)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
@@ -134,12 +146,17 @@ class InvoiceResult(BaseModel):
     totals: Totals
     validation: ValidationReport
     created_at: str
+    # Populated only after the invoice has been voided.
+    voided_at: Optional[str] = None
+    voided_by: Optional[str] = None
+    void_reason: Optional[str] = None
 
 
 class InvoiceSummary(BaseModel):
     invoice_id: str
     invoice_number: str
     currency: str
+    status: str
     grand_total: Decimal
     created_at: str
 

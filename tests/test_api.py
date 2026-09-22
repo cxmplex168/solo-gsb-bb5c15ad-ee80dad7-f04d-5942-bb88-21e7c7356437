@@ -16,6 +16,15 @@ def client(tmp_path):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture()
+def client_and_store(tmp_path):
+    store = InvoiceStore(str(tmp_path / "test.db"))
+    app.dependency_overrides[get_store] = lambda: store
+    with TestClient(app) as c:
+        yield c, store
+    app.dependency_overrides.clear()
+
+
 def valid_payload(**overrides):
     payload = {
         "invoice_number": "INV-2026-0001",
@@ -276,6 +285,135 @@ class TestBatchCreate:
         )
         assert resp.status_code == 422
         assert client.get("/api/v1/invoices").json() == []
+
+
+class TestVoidInvoice:
+    def _void(self, client, invoice_id, **overrides):
+        payload = {
+            "reason": "Issued twice for the same order",
+            "operator": "finance-zhang",
+        }
+        payload.update(overrides)
+        return client.post(f"/api/v1/invoices/{invoice_id}/void", json=payload)
+
+    def _event_count(self, store, invoice_id):
+        with store._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM void_events WHERE invoice_id = ?",
+                (invoice_id,),
+            ).fetchone()["n"]
+
+    def test_void_validated_invoice(self, client_and_store):
+        client, store = client_and_store
+        invoice_id = client.post(
+            "/api/v1/invoices", json=valid_payload()
+        ).json()["invoice_id"]
+
+        resp = self._void(client, invoice_id)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "voided"
+        assert body["void_reason"] == "Issued twice for the same order"
+        assert body["voided_by"] == "finance-zhang"
+        assert body["voided_at"] and body["voided_at"].endswith("Z")
+        # Financial content is still present; only the status/void fields change.
+        assert body["totals"]["grand_total"] == 236.44
+        assert self._event_count(store, invoice_id) == 1
+
+        # GET by id returns the void information.
+        got = client.get(f"/api/v1/invoices/{invoice_id}").json()
+        assert got["status"] == "voided"
+        assert got["voided_at"] == body["voided_at"]
+        assert got["voided_by"] == "finance-zhang"
+        assert got["void_reason"] == "Issued twice for the same order"
+
+    def test_repeat_void_returns_409_without_second_event(self, client_and_store):
+        client, store = client_and_store
+        invoice_id = client.post(
+            "/api/v1/invoices", json=valid_payload()
+        ).json()["invoice_id"]
+
+        first = self._void(client, invoice_id)
+        assert first.status_code == 200
+        first_voided_at = first.json()["voided_at"]
+
+        second = self._void(client, invoice_id, reason="second attempt")
+        assert second.status_code == 409
+        detail = second.json()["detail"]
+        assert detail["error"] == "already_voided"
+        # The 409 reports the original event, which must be unchanged.
+        assert detail["void"]["voided_at"] == first_voided_at
+        assert detail["void"]["reason"] == "Issued twice for the same order"
+
+        # Exactly one immutable event exists; GET still shows the original one.
+        assert self._event_count(store, invoice_id) == 1
+        got = client.get(f"/api/v1/invoices/{invoice_id}").json()
+        assert got["voided_at"] == first_voided_at
+        assert got["void_reason"] == "Issued twice for the same order"
+
+    def test_void_missing_invoice_404(self, client):
+        resp = self._void(client, "does-not-exist")
+        assert resp.status_code == 404
+
+    def test_non_validated_invoice_cannot_be_voided(self, client_and_store):
+        client, store = client_and_store
+        store.insert(
+            invoice_id="inv-inconsistent",
+            invoice_number="INV-INCONSISTENT",
+            request={},
+            result={
+                "status": "inconsistent",
+                "currency": "CNY",
+                "totals": {"grand_total": "0.00"},
+            },
+            created_at="2026-01-01T00:00:00Z",
+        )
+        resp = self._void(client, "inv-inconsistent")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["error"] == "invalid_status"
+        assert detail["status"] == "inconsistent"
+        assert self._event_count(store, "inv-inconsistent") == 0
+        # Status is untouched.
+        assert (
+            store.get_invoice("inv-inconsistent")["status"] == "inconsistent"
+        )
+
+    @pytest.mark.parametrize("field", ["reason", "operator"])
+    def test_void_requires_reason_and_operator(self, client, field):
+        invoice_id = client.post(
+            "/api/v1/invoices", json=valid_payload()
+        ).json()["invoice_id"]
+
+        payload = {"reason": "x", "operator": "y"}
+        payload[field] = "   "
+        resp = client.post(f"/api/v1/invoices/{invoice_id}/void", json=payload)
+        assert resp.status_code == 422
+
+    def test_list_excludes_voided_unless_include_voided(self, client):
+        first = client.post("/api/v1/invoices", json=valid_payload()).json()
+        second = client.post(
+            "/api/v1/invoices", json=valid_payload(invoice_number="INV-2026-0002")
+        ).json()
+        self._void(client, first["invoice_id"])
+
+        # Voided invoice is hidden from the default listing.
+        listed = client.get("/api/v1/invoices").json()
+        assert {item["invoice_number"] for item in listed} == {"INV-2026-0002"}
+
+        with_voided = client.get(
+            "/api/v1/invoices", params={"include_voided": "true"}
+        ).json()
+        by_number = {item["invoice_number"]: item for item in with_voided}
+        assert set(by_number) == {"INV-2026-0001", "INV-2026-0002"}
+        assert by_number["INV-2026-0001"]["status"] == "voided"
+        assert by_number["INV-2026-0002"]["status"] == "validated"
+
+        # include_voided=false behaves like the default.
+        assert (
+            client.get("/api/v1/invoices", params={"include_voided": "false"}).json()
+            == listed
+        )
 
 
 class TestQuery:
